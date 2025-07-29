@@ -1,1170 +1,737 @@
-/*
- * tunproxy.c --- small demo program for tunneling over UDP with tun/tap
- *
- * Copyright (C) 2003  Philippe Biondi <phil@secdev.org>
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms of the GNU Lesser General Public License as published by
- * the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful, but
- * WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * Lesser General Public License for more details.
- */
-
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
-
-#include <stdio.h>
-#include <stdlib.h>
-#include <time.h>
-#include <unistd.h>
-#include <signal.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <sys/timerfd.h>
-#include <netinet/in.h>
-#include <string.h>
-#include <net/if.h>
-#include <linux/if_tun.h>
-#include <getopt.h>
-#include <sys/ioctl.h>
-
-#include <memory.h>
-#include <errno.h>
-#include <arpa/inet.h>
-#include <netdb.h>
-
-#include <openssl/rsa.h>       /* SSLeay stuff */
-#include <openssl/crypto.h>
-#include <openssl/x509.h>
-#include <openssl/pem.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <signal.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/ioctl.h>
+#include <sys/timerfd.h>
+#include <netinet/in.h>
+#include <net/if.h>
+#include <linux/if_tun.h>
+#include <fcntl.h>
+#include <string.h>
+#include <arpa/inet.h>
+#include <getopt.h>
+#include <syslog.h>
+#include <ini.h>
 
-//#define exit(a)
-
-#define PERROR(x)          do { perror(x); exit(1); } while (0)
-#define ERROR(x, args ...) do { fprintf(stderr,"ERROR:" x, ## args); exit(1); } while (0)
-#define CHK_NULL(x)        if ((x)==NULL) exit (1)
-#define CHK_ERR(err,s)     if ((err)==-1) { perror(s); exit(1); }
-#define CHK_SSL(err)       if ((err)==-1) { ERR_print_errors_fp(stderr); exit(2); }
-
-//#define SLEEP(a)           if (DEBUG) {sleep(a);}
-#define SLEEP(a)             {sleep(a);}
-
-#define ABORT()            {killpg(getpgid(getpid()),SIGTERM);}
-
-#define CLIENT 0
-#define SERVER 1
-
-#define MAX_KEY_LENGTH   (32)
-#define IV_LENGTH        (16)
-#define BUFFER_LENGTH    (4096)
-#define HASH_LENGTH      (32)
+#define MAX_KEY_LENGTH 32
+#define IV_LENGTH 16
+#define BUFFER_LENGTH 4096
+#define HASH_LENGTH 32
 #define MAX_BLOCK_LENGTH (BUFFER_LENGTH + EVP_MAX_BLOCK_LENGTH + HASH_LENGTH)
+#define POKE_INTERVAL 3
 
-#define POKE_INTERVAL_IN_SECS   3
+#define CHK_NULL(x) if (!(x)) { syslog(LOG_ERR, "Null pointer: %s", #x); exit(1); }
+#define CHK_ERR(err,s) if ((err) == -1) { syslog(LOG_ERR, "%s: %s", s, strerror(errno)); exit(1); }
+#define CHK_SSL(err,s) if ((err) <= 0) { ERR_print_errors_fp(stderr); syslog(LOG_ERR, "%s", s); exit(2); }
 
-/* from cli.cpp */
-#define CCERTF "client.crt"
-#define CKEYF  "client.key"
-#define CCACERT "ca.crt"
+typedef enum { CLIENT, SERVER } Mode;
 
-/* from serv.cpp */
-/* define HOME to be dir for key and cert files... */
-#define HOME "./"
-/* Make these what you want for cert & key files */
-#define SCERTF  HOME "server.crt"
-#define SKEYF   HOME "server.key"
-#define SCACERT HOME "ca.crt"
+typedef struct {
+    char key[MAX_KEY_LENGTH + 1];
+    unsigned char iv[IV_LENGTH];
+    char cert_file[256];
+    char key_file[256];
+    char ca_file[256];
+    char interface[IFNAMSIZ];
+    int port;
+    char target_ip[16];
+    Mode mode;
+    int debug;
+} Config;
 
+typedef struct {
+    int tun_fd;
+    int udp_fd;
+    int tcp_fd;
+    SSL_CTX *ssl_ctx;
+    SSL *ssl;
+    struct sockaddr_in remote_addr;
+    int remote_len;
+    int pipe_fd[2];
+    int timer_fd;
+} Connection;
 
-char KEY[MAX_KEY_LENGTH+1] = "Wazaaaaaaaaaaahhhh !";
-unsigned char IV[IV_LENGTH] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
-char pokemsg[BUFFER_LENGTH]; /* Used for client/server "poke" communication */
-char msg[BUFFER_LENGTH]; /* Used for client/server SSL comm while tunnels are off and messages from parent/child */
-char buf[MAX_BLOCK_LENGTH]; /* Used exclusively within child processes for tunnel/UDP transfers */
-unsigned char out[MAX_BLOCK_LENGTH];
-unsigned char md_value[HASH_LENGTH];
-char szCommonName[512];
-int md_len = 0;
-int DEBUG = 0;
-char *progname;
+Config config = {
+    .key = "defaultkey1234567890123456789012",
+    .iv = {0},
+    .cert_file = "cert.pem",
+    .key_file = "key.pem",
+    .ca_file = "ca.pem",
+    .interface = "tun%d",
+    .port = 0,
+    .target_ip = "",
+    .mode = -1,
+    .debug = 0
+};
 
-void do_encrypt(char *in, int inl, char *out, int *outl)
-{
-    EVP_CIPHER_CTX ctx;
-    int tmpl = 0;
-
-    if (DEBUG) write(1,"0", 1);
-    EVP_CIPHER_CTX_init(&ctx);
-    if (DEBUG) write(1,"1", 1);
-    if(0 == EVP_EncryptInit_ex(&ctx, EVP_aes_128_cbc(), NULL, KEY, IV)) PERROR("EVP_EncryptInit_ex");
-    if (DEBUG) write(1,"2", 1);
-    if(0 == EVP_EncryptUpdate(&ctx, out, outl, in, inl))                PERROR("EVP_EncryptUpdate");
-    if (DEBUG) write(1,"3", 1);
-    if(0 == EVP_EncryptFinal_ex(&ctx, out+*outl, &tmpl))                PERROR("EVP_EncryptFinal_ex");
-    *outl += tmpl;
-    if (DEBUG) write(1,"4", 1);
-    EVP_CIPHER_CTX_cleanup(&ctx);
-    if (DEBUG) write(1,"5", 1);
+void log_message(int level, const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    if (config.debug) {
+        vfprintf(stderr, fmt, args);
+        fprintf(stderr, "\n");
+    }
+    vsyslog(level, fmt, args);
+    va_end(args);
 }
 
-void do_decrypt(char *in, int inl, char *out, int *outl)
-{
-    EVP_CIPHER_CTX ctx;
-    int tmpl = 0;
-
-    if (DEBUG) write(1,"6", 1);
-    EVP_CIPHER_CTX_init(&ctx);
-    if (DEBUG) write(1,"7", 1);
-    if(0 == EVP_DecryptInit_ex(&ctx, EVP_aes_128_cbc(), NULL, KEY, IV)) PERROR("EVP_DecryptInit_ex");
-    if (DEBUG) write(1,"8", 1);
-    if(0 == EVP_DecryptUpdate(&ctx, out, outl, in, inl))                PERROR("EVP_DecryptUpdate");
-    if (DEBUG) write(1,"9", 1);
-    if(0 == EVP_DecryptFinal_ex(&ctx, out+*outl, &tmpl))                PERROR("EVP_DecryptFinal_ex");
-    *outl += tmpl;
-    if (DEBUG) write(1,"a", 1);
-    EVP_CIPHER_CTX_cleanup(&ctx);
-    if (DEBUG) write(1,"b", 1);
+int init_tun_device(const char *ifname) {
+    struct ifreq ifr = {0};
+    int fd = open("/dev/net/tun", O_RDWR);
+    CHK_ERR(fd, "open tun device");
+    
+    ifr.ifr_flags = IFF_TUN;
+    strncpy(ifr.ifr_name, ifname, IFNAMSIZ);
+    CHK_ERR(ioctl(fd, TUNSETIFF, &ifr), "ioctl TUNSETIFF");
+    
+    log_message(LOG_INFO, "Allocated interface %s", ifr.ifr_name);
+    return fd;
 }
 
-int isEqual(char *h1, char *h2, int len){
-    int i = 0, j = 0;
-    unsigned char a, b;
+int init_udp_socket(int port) {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    CHK_ERR(fd, "create UDP socket");
+    
+    struct sockaddr_in sin = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_ANY),
+        .sin_port = htons(port)
+    };
+    
+    CHK_ERR(bind(fd, (struct sockaddr*)&sin, sizeof(sin)), "bind UDP socket");
+    return fd;
+}
 
-    for(i = 0; i < len; i++){
-        a = (unsigned char)h1[i];
-        b = (unsigned char)h2[i];
-#if 1
-        for(j = 0; j < 8; j++){
-            if((a & 0x01) != (b & 0x01)){
-                return 0;
+int init_tcp_socket(int port, Mode mode) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    CHK_ERR(fd, "create TCP socket");
+    
+    struct sockaddr_in sin = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_ANY),
+        .sin_port = htons(port)
+    };
+    
+    CHK_ERR(bind(fd, (struct sockaddr*)&sin, sizeof(sin)), "bind TCP socket");
+    if (mode == SERVER) {
+        CHK_ERR(listen(fd, 5), "listen TCP socket");
+    }
+    return fd;
+}
+
+SSL_CTX* init_ssl_context(Mode mode) {
+    const SSL_METHOD *method = mode == CLIENT ? TLS_client_method() : TLS_server_method();
+    SSL_CTX *ctx = SSL_CTX_new(method);
+    CHK_NULL(ctx);
+    
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+    CHK_ERR(SSL_CTX_load_verify_locations(ctx, config.ca_file, NULL), "load CA");
+    CHK_ERR(SSL_CTX_use_certificate_file(ctx, config.cert_file, SSL_FILETYPE_PEM), "load cert");
+    CHK_ERR(SSL_CTX_use_PrivateKey_file(ctx, config.key_file, SSL_FILETYPE_PEM), "load key");
+    CHK_ERR(SSL_CTX_check_private_key(ctx), "check private key");
+    
+    return ctx;
+}
+
+void encrypt_data(const unsigned char *in, int in_len, unsigned char *out, int *out_len) {
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    CHK_NULL(ctx);
+    
+    int tmp_len;
+    CHK_ERR(EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, (unsigned char*)config.key, config.iv), "encrypt init");
+    CHK_ERR(EVP_EncryptUpdate(ctx, out, out_len, in, in_len), "encrypt update");
+    CHK_ERR(EVP_EncryptFinal_ex(ctx, out + *out_len, &tmp_len), "encrypt final");
+    *out_len += tmp_len;
+    
+    EVP_CIPHER_CTX_free(ctx);
+}
+
+void decrypt_data(const unsigned char *in, int in_len, unsigned char *out, int *out_len) {
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    CHK_NULL(ctx);
+    
+    int tmp_len;
+    CHK_ERR(EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, (unsigned char*)config.key, config.iv), "decrypt init");
+    CHK_ERR(EVP_DecryptUpdate(ctx, out, out_len, in, in_len), "decrypt update");
+    CHK_ERR(EVP_DecryptFinal_ex(ctx, out + *out_len, &tmp_len), "decrypt final");
+    *out_len += tmp_len;
+    
+    EVP_CIPHER_CTX_free(ctx);
+}
+
+void create_hmac(const unsigned char *in, int in_len, unsigned char *out, unsigned int *out_len) {
+    HMAC_CTX *ctx = HMAC_CTX_new();
+    CHK_NULL(ctx);
+    
+    CHK_ERR(HMAC_Init_ex(ctx, config.key, strlen(config.key), EVP_sha256(), NULL), "HMAC init");
+    CHK_ERR(HMAC_Update(ctx, in, in_len), "HMAC update");
+    CHK_ERR(HMAC_Final(ctx, out, out_len), "HMAC final");
+    
+    HMAC_CTX_free(ctx);
+}
+
+int verify_hmac(const unsigned char *data, int data_len, const unsigned char *received_hmac, int hmac_len) {
+    unsigned char computed_hmac[HASH_LENGTH];
+    unsigned int computed_len;
+    
+    create_hmac(data, data_len, computed_hmac, &computed_len);
+    return computed_len == hmac_len && memcmp(computed_hmac, received_hmac, hmac_len) == 0;
+}
+
+int load_config(const char *filename) {
+    ini_t *ini = ini_load(filename, NULL);
+    if (!ini) {
+        log_message(LOG_ERR, "Failed to load config file %s", filename);
+        return -1;
+    }
+    
+    const char *value;
+    if ((value = ini_get(ini, "crypto", "key"))) strncpy(config.key, value, MAX_KEY_LENGTH);
+    if ((value = ini_get(ini, "crypto", "cert_file"))) strncpy(config.cert_file, value, 256);
+    if ((value = ini_get(ini, "crypto", "key_file"))) strncpy(config.key_file, value, 256);
+    if ((value = ini_get(ini, "crypto", "ca_file"))) strncpy(config.ca_file, value, 256);
+    if ((value = ini_get(ini, "network", "interface"))) strncpy(config.interface, value, IFNAMSIZ);
+    if ((value = ini_get(ini, "network", "port"))) config.port = atoi(value);
+    if ((value = ini_get(ini, "network", "target_ip"))) strncpy(config.target_ip, value, 16);
+    if ((value = ini_get(ini, "general", "mode"))) config.mode = strcmp(value, "client") == 0 ? CLIENT : SERVER;
+    if ((value = ini_get(ini, "general", "debug"))) config.debug = atoi(value);
+    
+    ini_free(ini);
+    return 0;
+}
+
+void display_client_menu(void) {
+    printf("\n");
+    printf("k - Enter KEY\n");
+    printf("i - Enter IV\n");
+    printf("r - Randomize KEY/IV pair\n");
+    printf("c - Clear Session\n");
+    printf("s - STOP\n");
+    printf("> ");
+    fflush(stdout);
+}
+
+void randomize_string(char *str, int len) {
+    for (int i = 0; i < len; i++) {
+        str[i] = (rand() % 93) + 33;
+    }
+    str[len] = '\0';
+}
+
+void randomize_array(unsigned char *arr, int len) {
+    for (int i = 0; i < len; i++) {
+        arr[i] = rand() % 256;
+    }
+}
+
+void handle_client(Connection *conn) {
+    fd_set fdset;
+    char msg[BUFFER_LENGTH];
+    char pokemsg[BUFFER_LENGTH];
+    char common_name[512] = {0};
+    int poke_count = 0;
+    int cn_valid = 0, key_valid = 0, iv_valid = 0;
+    
+    conn->tcp_fd = socket(AF_INET, SOCK_STREAM, 0);
+    CHK_ERR(conn->tcp_fd, "create TCP socket");
+    
+    struct sockaddr_in sa = {
+        .sin_family = AF_INET,
+        .sin_port = htons(config.port)
+    };
+    inet_aton(config.target_ip, &sa.sin_addr);
+    
+    CHK_ERR(connect(conn->tcp_fd, (struct sockaddr*)&sa, sizeof(sa)), "connect TCP socket");
+    
+    conn->ssl = SSL_new(conn->ssl_ctx);
+    CHK_NULL(conn->ssl);
+    SSL_set_fd(conn->ssl, conn->tcp_fd);
+    CHK_SSL(SSL_connect(conn->ssl), "SSL connect");
+    
+    log_message(LOG_INFO, "SSL connection using %s", SSL_get_cipher(conn->ssl));
+    
+    X509 *server_cert = SSL_get_peer_certificate(conn->ssl);
+    CHK_NULL(server_cert);
+    char *str = X509_NAME_oneline(X509_get_subject_name(server_cert), 0, 0);
+    log_message(LOG_INFO, "Server certificate subject: %s", str);
+    OPENSSL_free(str);
+    str = X509_NAME_oneline(X509_get_issuer_name(server_cert), 0, 0);
+    log_message(LOG_INFO, "Server certificate issuer: %s", str);
+    OPENSSL_free(str);
+    X509_free(server_cert);
+    
+    printf("MiniVPN Client...\n");
+    display_client_menu();
+    
+    while (1) {
+        FD_ZERO(&fdset);
+        FD_SET(STDIN_FILENO, &fdset);
+        FD_SET(conn->tcp_fd, &fdset);
+        
+        if (select(conn->tcp_fd + 1, &fdset, NULL, NULL, NULL) < 0) {
+            log_message(LOG_ERR, "Client select: %s", strerror(errno));
+            break;
+        }
+        
+        if (FD_ISSET(conn->tcp_fd, &fdset)) {
+            int err = SSL_read(conn->ssl, pokemsg, sizeof(pokemsg) - 1);
+            if (err <= 0) {
+                log_message(LOG_ERR, "SSL read failed");
+                break;
             }
-
-            a = a >> 1;
-            b = b >> 1;
-        }// for
-#else
-        if (a != b) {
-            return 0;
-        }// if
-#endif
-    }// for
-
-    return 1;
-}
-
-void printHash(unsigned char *hash,int len)
-{
-    int i=0;
-
-    while ( i<len) {
-        printf("%02x",(unsigned int)hash[i]);
-        i++;
-    }
-}
-
-void dumpBuf(unsigned char *buf, int len)
-{
-    int i = 0;
-
-    for (i=0; i<len; i++) {
-        printf("%02X",buf[i]);
-    }
-}
-
-void createHash(unsigned char *in, int inl, unsigned char *md_value, int *md_len)
-{
-    HMAC_CTX ctx;
-    const EVP_MD *md;
-
-    // Create new digest
-    OpenSSL_add_all_digests();
-    md = EVP_get_digestbyname("sha256");
-    HMAC_CTX_init(&ctx);
-    HMAC_Init_ex(&ctx, KEY, sizeof(KEY), md, NULL);
-    HMAC_Update(&ctx, in, inl);
-    HMAC_Final(&ctx, md_value, md_len);
-    if (DEBUG) {printf("in: "); dumpBuf(in,inl); printf(" inl: %d  md_value: ",inl);}
-    if (DEBUG) printHash(md_value,*md_len);
-    if (DEBUG) printf(" md_len: %d\n",*md_len);
-}
-
-void usage()
-{
-    fprintf(stderr, "Usage: %s [-s port|-c targetip:port] [-e]\n", progname);
-    exit(0);
-}
-
-int getch()
-{
-    int r;
-    unsigned char c;
-    if ((r = read(0, &c, sizeof(c))) < 0) {
-        return r;
-    } else {
-        return c;
-    }
-}
-
-void randomizeString(char *pszStr,int len)
-{
-   int i;
-   for (i=0; i<len; i++) {
-      pszStr[i] = rand() % 93 + 33;
-   }//for
-}
-
-void randomizeArray(unsigned char *pArray,int len)
-{
-   int i;
-   for (i=0; i<len; i++) {
-      pArray[i] = rand() % 255;
-   }//for
-}
-
-void displayClientMenu(void)
-{
-   /* Display menu of choices */
-   printf("\n");
-   printf("k - Enter KEY\n");
-   printf("i - Enter IV\n");
-   printf("r - Randomize KEY/IV pair\n");
-   printf("c - Clear Session\n");
-   printf("s - STOP\n");
-   printf("> - ");
-   fflush(stdout);
-}
-
-int main(int argc, char *argv[])
-{
-   struct sockaddr_in sin, from, sout;
-   struct ifreq ifr;
-   int fd_tunnel, fd_udp, fd_tcp, fromlen, soutlen, port, PORT, l;
-   char c, *p, *ip;
-   fd_set fdset;    
-   int outl = sizeof(out);
-   int cliserv = -1; /* must be specified on cmd line */
-   int flags   = IFF_TUN; /* default */
-   char if_name[IFNAMSIZ] = "";
-   int i;
-   int fds[2];
-   pid_t pid;
-   
-   /* initialize random seed */
-   srand(time(NULL));
-   
-   progname = argv[0];
-
-   while ((c = getopt(argc, argv, "s:c:ehd")) != -1) {
-      switch (c) {
-         case 'h':
-            usage();
-         case 'd':
-            DEBUG++;
-            break;
-         case 's':
-            cliserv = SERVER;
-            PORT = atoi(optarg);
-            break;
-         case 'c':
-            cliserv = CLIENT;
-            p = memchr(optarg,':',16);
-            if (!p) ERROR("invalid argument : [%s]\n",optarg);
-            *p = 0;
-            ip = optarg;
-            port = atoi(p+1);
-            PORT = 0;
-            break;
-         case 'e':
-            flags = IFF_TAP;
-            break;
-         default:
-            usage();
-      }//switch
-   }//while
-   if (cliserv < 0) usage();
-
-   /* Establish the Tunnel connection */
-   if ((fd_tunnel = open("/dev/net/tun",O_RDWR)) < 0) PERROR("open");
-
-   memset(&ifr, 0, sizeof(ifr));
-   ifr.ifr_flags = flags;
-   strncpy(ifr.ifr_name, "toto%d", IFNAMSIZ);
-   if (ioctl(fd_tunnel, TUNSETIFF, (void *)&ifr) < 0) PERROR("ioctl");
-
-   printf("Allocated interface %s. Configure and use it\n", ifr.ifr_name);
-
-   /* Establish the UDP Network connection */
-   fd_udp = socket(PF_INET, SOCK_DGRAM, 0);
-   sin.sin_family = AF_INET;
-   sin.sin_addr.s_addr = htonl(INADDR_ANY);
-   sin.sin_port = htons(PORT);
-   if (bind(fd_udp,(struct sockaddr *)&sin, sizeof(sin)) < 0) PERROR("UDP-bind");
-
-   /* Establish the TCP Network connection */
-   fd_tcp = socket(PF_INET, SOCK_STREAM, 0);
-   sin.sin_family = AF_INET;
-   sin.sin_addr.s_addr = htonl(INADDR_ANY);
-   sin.sin_port = htons(PORT);
-   if (bind(fd_tcp,(struct sockaddr *)&sin, sizeof(sin)) < 0) PERROR("TCP-bind");
-
-   if (cliserv == CLIENT) {
-      /* CLIENT */
-      int err = -1;
-      int sd = -1;
-      struct sockaddr_in sa;
-      int salen = sizeof(sa);
-      SSL_CTX* ctx = NULL;
-      SSL*     ssl = NULL;
-      X509*    server_cert;
-      char*    str = NULL;
-      SSL_METHOD *meth = SSLv23_client_method(); //SSLv2_client_method();
-      char     input;
-      int      cnValid  = 0;
-      int      keyValid = 0;
-      int      ivValid  = 0;
-      int      poke_count = 0;
-      
-      /* Create a pipe with two ends of pipe placed in fds[2], read_end=0, write_end=1 */
-      pipe(fds);
-      /* Fork a child process */
-      pid = fork();
-      if (pid > (pid_t) 0) { /* TCP/SSL get Keys */
-         /* Client-Parent process */
-
-         /* close our copy of the read end of pipe */
-         close(fds[0]);
-
-         /* Display startup message */
-         printf("MiniVPN Client...\n");
-
-         /* Output menu of choices */
-         displayClientMenu();
-         fflush(stdout);
-         
-         while(1) {
-            /* Wait for TCP or user to make choice */
-            FD_ZERO(&fdset);
-            FD_SET(STDIN_FILENO,&fdset);
-            FD_SET(fd_tcp,&fdset);
-            if (select(STDIN_FILENO+fd_tcp+1,&fdset,NULL,NULL,NULL) < 0) PERROR("Client-Parent select");
-            if (FD_ISSET(fd_tcp, &fdset)) {
-               if (ssl) {
-                  /* Process POKE from Server */
-                  if (DEBUG) printf("Client Waiting on Server... ");
-                  err = SSL_read(ssl,pokemsg,sizeof(pokemsg)-1);
-                  if (!strncmp(pokemsg,"POKE",4)) {
-                     if (DEBUG) printf("Received '%s', ",pokemsg);
-                     if (DEBUG) printf("Sending POKE_ACK, #pokes=%d\n",poke_count++);
-                     err = SSL_write(ssl,"POKE_ACK",strlen("POKE_ACK"));
-                     if (-1 == err) {ERR_print_errors_fp(stderr); continue;}
-                  }//if
-                  else if (-1 == err) {
-                     PERROR("Client-Parent select");
-                  }//else if
-               }//if ssl
-            }//if fd_tcp
-            if (FD_ISSET(STDIN_FILENO, &fdset)) {
-               /* Notify the child process to STOP send/receive packets */
-               strcpy(msg,"STOP");
-               write(fds[1],msg,strlen(msg)+1);
-               SLEEP(1);
-               
-               /* Close down current SSL session */
-               printf("Clearing SSL session... ");
-               /* send SSL/TLS close_notify */
-               if (NULL != ssl) SSL_shutdown(ssl);
-               /* Clean up. */
-               if (sd >= 0)     {close (sd);        sd =    -1;}
-               if (NULL != ssl) {SSL_free(ssl);     ssl = NULL;}
-               if (NULL != ctx) {SSL_CTX_free(ctx); ctx = NULL;}
-               poke_count = 0;
-               printf("Done\n");
-               SLEEP(1);
-
-               /* Get User Choice */
-               input = getch();
-               
-               /* Process User Choice */
-               if ('k' == tolower(input)) {
-                  printf("\nKEY option...");
-                  printf("\nEnter CommonName(CN)\n");
-                  printf(">");
-                  fflush(stdout);
-                  memset(szCommonName,0,sizeof(szCommonName));
-                  scanf("%s",szCommonName);
-                  printf("\nEnter KEY\n");
-                  printf("[--------------------------------]\n");
-                  printf(">");
-                  fflush(stdout);
-                  memset(msg,0,sizeof(msg));
-                  scanf("%s",msg);
-                  memset(KEY,0,sizeof(KEY));
-                  strncpy(KEY,msg,MAX_KEY_LENGTH);
-               }//if
-               else if ('i' == tolower(input)) {
-                  printf("\nIV option...");
-                  printf("\nEnter CommonName(CN)\n");
-                  printf(">");
-                  fflush(stdout);
-                  memset(szCommonName,0,sizeof(szCommonName));
-                  scanf("%s",szCommonName);
-                  printf("\nEnter IV (%d numbers)\n",IV_LENGTH);
-                  printf("[----------------]\n");
-                  printf(">");
-                  fflush(stdout);
-                  for (i=0; i<IV_LENGTH; i++) IV[i]=getch();
-                  getch();
-               }//else if
-               else if ('r' == tolower(input)) {
-                  printf("\nRandomize KEY/IV option...");
-                  printf("\nEnter CommonName(CN)\n");
-                  printf(">");
-                  fflush(stdout);
-                  memset(szCommonName,0,sizeof(szCommonName));
-                  scanf("%s",szCommonName);
-                  printf("Random KEY and IV are being generated... ");
-                  /* Randomly generate ... KEY, IV */
-                  memset(KEY,0,sizeof(KEY));
-                  randomizeString(KEY,sizeof(KEY)-1);
-                  randomizeArray(IV,sizeof(IV));
-                  printf("Done\n");
-               }//else if
-               else if ('c' == tolower(input)) {
-                  /* Close down current SSL session */
-                  printf("Clearing SSL session... ");
-                  /* send SSL/TLS close_notify */
-                  if (NULL != ssl) SSL_shutdown(ssl);
-                  /* Clean up. */
-                  if (sd >= 0)     {close (sd);        sd =    -1;}
-                  if (NULL != ssl) {SSL_free(ssl);     ssl = NULL;}
-                  if (NULL != ctx) {SSL_CTX_free(ctx); ctx = NULL;}
-                  poke_count = 0;
-                  printf("Done\n");
-                  SLEEP(1);
-                  continue;               
-               }//else if
-               else if ('s' == tolower(input)) {
-                  printf("\nClosing Tunnel... ");
-                  close(fd_tunnel);
-                  printf("Cleanup Done\n");
-                  printf("GoodBye\n");
-                  printf("Killing process tree\n");
-                  SLEEP(1);
-                  killpg(getpgid(getpid()),SIGTERM); /* Kill the complete process tree including child. */
-                  SLEEP(2);
-                  printf("Press Control-C to terminate\n");
-                  while(1);
-               }//else if
-               else {
-                  /* Output menu of choices */
-                  displayClientMenu();
+            pokemsg[err] = '\0';
+            if (strncmp(pokemsg, "POKE", 4) == 0) {
+                log_message(LOG_DEBUG, "Received POKE, sending POKE_ACK (%d)", poke_count++);
+                CHK_SSL(SSL_write(conn->ssl, "POKE_ACK", strlen("POKE_ACK")), "SSL write POKE_ACK");
+            }
+        }
+        
+        if (FD_ISSET(STDIN_FILENO, &fdset)) {
+            // Notify child to stop
+            strcpy(msg, "STOP");
+            write(conn->pipe_fd[1], msg, strlen(msg) + 1);
+            sleep(1);
             
-                  continue;
-               }//else
-                 
-               /* Echo back to the user the CN + KEY + IV being used */
-               if (DEBUG)  printf("CN  is: [%s]\n",szCommonName);
-               if (DEBUG)  printf("KEY is: [%s]\n",KEY);
-               if (DEBUG) {printf("IV  is: ["); dumpBuf(IV,IV_LENGTH); printf("]\n\n");}
-               
-               if (DEBUG)  printf("Session: ctx=%p, ssl=%p, sd=%d\n",ctx,ssl,sd);
-
-               /* PKI: Authenticate the Server */
-               if (!ctx || !ssl || (sd < 0)) {
-                  if (DEBUG) printf("PKI: Authenticating the Server...\n");
-                  SSLeay_add_ssl_algorithms();
-                  SSL_load_error_strings();
-                  ctx = SSL_CTX_new(meth);
-                  if (NULL == ctx) {if (DEBUG) printf("ctx error\n");err=-1;continue;};
-
-                  SSL_CTX_set_verify(ctx,SSL_VERIFY_PEER,NULL);
-                  SSL_CTX_load_verify_locations(ctx,CCACERT,NULL);
-
-                  if (SSL_CTX_use_certificate_file(ctx,CCERTF,SSL_FILETYPE_PEM)<=0){
-                     ERR_print_errors_fp(stderr);err=-2;continue;}
-                  if (SSL_CTX_use_PrivateKey_file(ctx,CKEYF,SSL_FILETYPE_PEM)  <=0){
-                     ERR_print_errors_fp(stderr);err=-3;continue;}
-                  if (!SSL_CTX_check_private_key(ctx)){
-                     printf("Private key doesn't match cert. public key\n");err=-4;continue;}
-
-                  /* Create a socket and connect to server using normal socket calls. */
-                  sd = socket (AF_INET, SOCK_STREAM, 0);
-                  if (-1 == sd) {perror("socket");err=-5;continue;}
-
-                  memset(&sa,0,sizeof(sa));
-                  sa.sin_family = AF_INET;
-                  inet_aton(ip, &sa.sin_addr); /* Server IP */
-                  sa.sin_port   = htons(port); /* Server Port */
-
-                  err = connect(sd,(struct sockaddr*)&sa,sizeof(sa));
-                  if (-1 == err) {perror("connect");err=-6;continue;}
-
-                  /* Now we have TCP connection. Start SSL negotiation. */
-                  ssl = SSL_new(ctx);     if (NULL == ssl) {printf("TCP connect failure\n");err=-7;continue;}
-                  SSL_set_fd(ssl,sd);
-                  err = SSL_connect(ssl); if (-1 == err) {ERR_print_errors_fp(stderr);err=-8;continue;};
-
-                  /* Following two steps are optional and not required for data exchange to be successful. */
-
-                  /* Get the cipher - opt */
-                  if (DEBUG) printf("SSL connection using %s\n",SSL_get_cipher(ssl));
-
-                  /* Get server's certificate (note: beware of dynamic allocation) - opt */
-                  server_cert = SSL_get_peer_certificate(ssl);
-                  if (NULL == server_cert){err=-9;continue;}
-                  if (DEBUG) printf("Server certificate:\n");
-
-                  str = X509_NAME_oneline(X509_get_subject_name(server_cert),0,0);
-                  if (NULL == str){err=-10;continue;}
-                  //if (subjectstr) strcpy(subjectstr,str);
-                  if (DEBUG) printf("\t subject: %s\n",str);
-                  OPENSSL_free(str);
-
-                  str = X509_NAME_oneline(X509_get_issuer_name(server_cert),0,0);
-                  if (NULL == str){err=-11;continue;}
-                  //if (issuerstr) strcpy(issuerstr,str);
-                  if (DEBUG) printf("\t issuer: %s\n",str);
-                  OPENSSL_free(str);
-
-                  /* We can do all sorts of certificate verification stuff here before
-                     deallocating the certificate. */
-                  X509_free(server_cert);
-               }//if
-
-               /* DATA EXCHANGE AREA */
-               if (ssl) {
-                  /* Write CommonName (CN) to Server */
-                  if (DEBUG) printf("Writing CN [%s] to Server\n",szCommonName);
-                  strcpy(msg,"CN:");
-                  strcat(msg,szCommonName);
-                  err = SSL_write(ssl,msg,strlen(msg));  if (-1 == err) {ERR_print_errors_fp(stderr); continue;}
-                  /* Read CN reply from Server */
-                  err = SSL_read(ssl,msg,sizeof(msg)-1); if (-1 == err) {ERR_print_errors_fp(stderr); continue;}
-                  msg[err] = '\0';
-                  if (DEBUG) printf("Server replied with %d chars:'%s'\n",err,msg);
-                  if (strncmp(msg,"CN_ACK",6)) {cnValid=0;printf("Client_CN_ACK_Error\n");}
-                  else cnValid=1;
-                  
-                  /* Write KEY to Server */
-                  if (DEBUG) printf("Writing KEY [%s] to Server\n",KEY);
-                  strcpy(msg,"KEY:");
-                  strcat(msg,KEY);
-                  err = SSL_write(ssl,msg,strlen(msg));  if (-1 == err) {ERR_print_errors_fp(stderr); continue;}
-                  /* Read KEY reply from Server */
-                  err = SSL_read(ssl,msg,sizeof(msg)-1); if (-1 == err) {ERR_print_errors_fp(stderr); continue;}
-                  msg[err] = '\0';
-                  if (DEBUG) printf("Server replied with %d chars:'%s'\n",err,msg);
-                  if (strncmp(msg,"KEY_ACK",7)) {keyValid=0;printf("Client_KEY_ACK_Error\n");}
-                  else keyValid=1;
-                  
-                  /* Write IV to Server */
-                  if (DEBUG) {printf("Writing IV ["); dumpBuf(IV,IV_LENGTH); printf("] to Server\n");}
-                  strcpy(msg,"IV:");
-                  memcpy(&msg[3],&IV,sizeof(IV));
-                  err = SSL_write(ssl,msg,3+sizeof(IV)); if (-1 == err) {ERR_print_errors_fp(stderr); continue;}
-                  /* Read IV reply from Server */
-                  err = SSL_read(ssl,msg,sizeof(msg)-1); if (-1 == err) {ERR_print_errors_fp(stderr); continue;}
-                  msg[err] = '\0';
-                  if (DEBUG) printf("Server replied with %d chars:'%s'\n",err,msg);
-                  if (strncmp(msg,"IV_ACK",6)) {ivValid=0;printf("Client_IV_ACK_Error\n");}
-                  else ivValid=1;
-
-                  /* Configure Client-Child to enable tunnel */
-                  if (cnValid && keyValid && ivValid) {
-                     /* Write KEY to the child process */
-                     if (DEBUG) printf("Issuing KEY to Client-Child\n");
-                     strcpy(msg,"KEY:");
-                     strcat(msg,KEY);
-                     write(fds[1],msg,strlen(msg)+1);
-                     SLEEP(1);
-                                    
-                     /* Write IV to the child process */
-                     if (DEBUG) printf("Issuing IV to Client-Child\n");
-                     strcpy(msg,"IV:");
-                     memcpy(&msg[3],&IV,sizeof(IV));
-                     write(fds[1],msg,3+sizeof(IV));
-                     SLEEP(1);
-                  
-                     /* Initialize FROM to point to Server's ip:port */
-                     memset(&from,0,sizeof(from));
-                     fromlen = sizeof(from);
-                     from.sin_family = AF_INET;
-                     from.sin_port = htons(port);
-                     inet_aton(ip,&from.sin_addr);
-
-                     /* Write FROM to the child process */
-                     if (DEBUG) printf("Informing Client-Child the server's UDP addr+port\n");
-                     strcpy(msg,"FROM:");
-                     memcpy(&msg[5],&from,sizeof(from));
-                     write(fds[1],msg,5+sizeof(from));
-                     SLEEP(1);
-
-                     /* Notify the child process to be ready to send/receive packets */
-                     if (DEBUG) printf("Issuing START to Client-Child\n");
-                     strcpy(msg,"START");
-                     write(fds[1],msg,strlen(msg)+1);
-                     SLEEP(1);
-                  }//if
-               }//if ssl
-            }//else if STDIN_FILENO
-         }//while
-       }//if Client-PARENT
-       else {                 /* UDP use keys */
-          /* Client-Child process */
-         int okToStart = 0;
-         struct sockaddr_in from;
-
-          /* close our copy of the write end of pipe */
-          close(fds[1]);
-
-         /* Set unblock pipe read */
-         
-         /* Tunnel connection */
-         
-         /* Keep reading from fds[0], fd_udp, fd_tunnel */
-         
-         /* If notification is not received, do not send/receive */
-         
-         /* while(true){if (read(fds[0]) == "start") break;} */
-         
-         /* while(true){select from fd_udp and fd_tunnel, encryption/decryption, hash, sending/receiving packets} */
-
-          while (1) {
-              FD_ZERO(&fdset);
-              FD_SET(fds[0],   &fdset); /* Pipe from Parent */
-              FD_SET(fd_tunnel,&fdset); /* Tunnel */
-              FD_SET(fd_udp,   &fdset); /* Net-UDP */
-              if (select(fds[0]+fd_tunnel+fd_udp+1,&fdset,NULL,NULL,NULL) < 0) PERROR("Client-Child select");
-              if (FD_ISSET(fds[0], &fdset)) {
-                  memset(buf,0,sizeof(buf));
-                  l = read(fds[0], buf, sizeof(buf));
-                  if (l < 0) PERROR("read");
-                  if (!strncmp(buf,"KEY:",4)) {
-                  if (DEBUG) printf("KEY: [%s] received from Client-Parent\n",&buf[4]);
-                  strncpy(KEY,&buf[4],sizeof(KEY));
-               }//if
-               else if (!strncmp(buf,"IV:",3)) {
-                  if (DEBUG) {printf("IV: [");dumpBuf(&buf[3],sizeof(IV));printf("] received from Client-Parent\n",&buf[3]);}
-                  memcpy(IV,&buf[3],sizeof(IV));
-               }//else if
-               else if (!strncmp(buf,"FROM:",5)) {
-                  if (DEBUG) printf("FROM: received from Client-Parent\n");
-                  memcpy(&from,&buf[5],sizeof(from));
-               }//else if
-               else if (!strncmp(buf,"START",5)) {
-                  if (DEBUG) printf("START received from Client-Parent\n");
-                  okToStart = 1;
-                  /*if (DEBUG)*/ printf("Client Tunnel running...\n");
-               }//else if
-               else if (!strncmp(buf,"STOP",4)) {
-                  if (DEBUG) printf("STOP received from Client-Parent\n");
-                  okToStart = 0;
-                  /*if (DEBUG)*/ printf("Client Tunnel stopped\n");
-               }//else if
-               else okToStart = 0;
-            }//if
-              else if (FD_ISSET(fd_tunnel, &fdset)) {
-                 if (okToStart) {
-                    /* wait for data from tunnel, then encrypt+hash, then send to "remote/from" network socket */
-                     if (DEBUG) write(1,">", 1);
-                     l = read(fd_tunnel, buf, sizeof(buf));
-                     if (l < 0) PERROR("read");
-                     else {
-                        if (DEBUG) {printf("\nTx=%d[",l); dumpBuf(buf,l); printf("]\n");}
-                        outl = sizeof(out);
-                        do_encrypt(buf,l,out,&outl);
-                        if (outl > MAX_BLOCK_LENGTH) PERROR("Encrypt Too Big");
-                        if (DEBUG) {printf("\nEncrypt=%d[",outl); dumpBuf(out,outl); printf("]\n");}
-                        createHash(buf, l, md_value, &md_len);
-                        if ((outl + md_len) > MAX_BLOCK_LENGTH) PERROR("Encrypt+Hash Too Big");
-                        if (DEBUG) {printf("Hash=%d[",md_len); dumpBuf(md_value,md_len); printf("]\n");}
-                        for (i=0; i<md_len; i++) {out[outl+i] = md_value[i];}
-                        outl += md_len;
-                        if (sendto(fd_udp, out, outl, 0, (struct sockaddr *)&from, sizeof(from)) < 0)PERROR("sendto");
-                     }//else
-                  }//if okToStart
-                  else if (!okToStart) { /* read from Tunnel and DISCARD */
-                     l = read(fd_tunnel, buf, sizeof(buf));
-                     if (l < 0) PERROR("read");
-                  }//else if !okToStart
-               }//else if
-               else if (FD_ISSET(fd_udp, &fdset)) {
-                  if (okToStart) {
-                     /* wait for data from "remote/from" node, audit connection, decrypt+rehash+audit,
-                       then forward to tunnel */
-                     if (DEBUG) write(1,"<", 1);
-                     /* do *not* use "from" so that we can audit which node the revieved packet comes from */
-                     soutlen = sizeof(sout);
-                     l = recvfrom(fd_udp, buf, sizeof(buf), 0, (struct sockaddr *)&sout, &soutlen);
-                     if (l < 0) {
-                         printf("fd_udp=%d,buf=%p,bufsize=%d,flags=%d,sockaddr=%p,soutlen=%p\n",
-                                 fd_udp,buf,sizeof(buf),0,&sout,&soutlen);
-                         PERROR("recvfrom");
-                     }//if
-                     else {
-                        /* audit to make sure data came from node "established" at connection time */
-                        if ((sout.sin_addr.s_addr != from.sin_addr.s_addr) || (sout.sin_port != from.sin_port)) {
-#if 0
-                             printf("Got packet from  %s:%i instead of %s:%i\n", 
-                                        (char *)inet_ntoa(sout.sin_addr/*.s_addr*/), ntohs(sout.sin_port),
-                                        (char *)inet_ntoa(from.sin_addr/*.s_addr*/), ntohs(from.sin_port));
-#endif
-                         }//if
-                         else {
-                            /* data from correct node, subtract off HASH, decrypt+rehash, audit hash,
-                               then forward to tunnel */
-                             l -= HASH_LENGTH;
-                             outl = sizeof(out);
-                             if (DEBUG) {printf("\nRx=%d[",l); dumpBuf(buf,l); printf("]\n");}
-                             if (DEBUG) {printf("Hash=%d[",HASH_LENGTH); dumpBuf(&buf[l],HASH_LENGTH); printf("]\n");}
-                             do_decrypt(buf,l,out,&outl);
-                             if (DEBUG) {printf("\nDecrypt=%d[",outl); dumpBuf(out,outl); printf("]\n");}
-                             createHash(out, outl, md_value, &md_len);
-                             if (!isEqual(&buf[l], md_value, md_len)) PERROR("HASH");
-                             if (write(fd_tunnel, out, outl) < 0) PERROR("write");
-                         }//else
-                     }//else
-                  }//if okToStart
-                  else if (!okToStart) { /* receive from node and DISCARD */
-                     soutlen = sizeof(sout);
-                     l = recvfrom(fd_udp, buf, sizeof(buf), 0, (struct sockaddr *)&sout, &soutlen);
-                     if (l < 0) {
-                         printf("fd_udp=%d,buf=%p,bufsize=%d,flags=%d,sockaddr=%p,soutlen=%p\n",
-                                 fd_udp,buf,sizeof(buf),0,&sout,&soutlen);
-                         PERROR("recvfrom");
-                     }//if
-                  }//else if !okToStart                 
-              }//else if
-          }//while
-       }// else Client-CHILD
-    }// if CLIENT
-    else {
-      /* SERVER */
-      int err = -1;
-      int listen_sd = fd_tcp;
-      int sd = -1;
-      //struct sockaddr_in sa_serv;
-      struct sockaddr_in sa_cli;
-      size_t client_len;
-      SSL_CTX* ctx = NULL;
-      SSL*     ssl = NULL;
-      X509*    client_cert = NULL;
-      char*    str = NULL;
-      char     subjectstr[512];
-      char     issuerstr[512];
-      SSL_METHOD *meth = SSLv23_server_method();
-      int cnValid  = 0;
-      int keyValid = 0;
-      int ivValid  = 0;
-      struct itimerspec time_period = {{POKE_INTERVAL_IN_SECS,0},{POKE_INTERVAL_IN_SECS,0}}; /* periodic timer */
-      struct timeval sel_timeout;
-      int timer_fd;
-      int result;
-      int poke_count = 0;
-      
-      /* create time to fire every 1 second */
-      timer_fd = timerfd_create(CLOCK_MONOTONIC,0);
-      if (timer_fd < 0) {printf("Timer fd failed\n");killpg(getpgid(getpid()),SIGTERM);}
-
-      result = timerfd_settime(timer_fd,0,&time_period,NULL);
-      if (result < 0) {printf("timer fd set time failed\n");killpg(getpgid(getpid()),SIGTERM);}
-
-      /* Create a pipe with two ends of pipe placed in fds[2], read_end=0, write_end=1 */
-      pipe(fds);
-      /* Fork a child process */
-      pid = fork();
-      if (pid > (pid_t) 0) { /* TCP get Keys */
-         /* Server-Parent process */
-
-         /* close our copy of the read end of pipe */
-         close(fds[0]);
-
-         /* Display startup message */
-         printf("MiniVPN Server...\n");         
-         fflush(stdout);
-         
-         while(1) {
-            FD_ZERO(&fdset);
-            FD_SET(fd_tcp,&fdset);
-            FD_SET(timer_fd,&fdset);
-            if (select(fd_tcp+timer_fd+1,&fdset,NULL,NULL,NULL) < 0) PERROR("Server-Parent select");
-            if (FD_ISSET(timer_fd, &fdset)) {
-               int s;
-               uint64_t exp;
-               s = read(timer_fd, &exp, sizeof(uint64_t));
-               
-               /* Reset time-interval in case altered */
-               time_period.it_interval.tv_sec  = POKE_INTERVAL_IN_SECS;
-               time_period.it_interval.tv_nsec = 0;
-               time_period.it_value.tv_sec     = POKE_INTERVAL_IN_SECS;
-               time_period.it_value.tv_nsec    = 0;
-               
-               /* Is SSL connection currently active with Client? */
-               if (ssl) {
-                  /* POKE_Client via SSL*/
-                  if (DEBUG) printf("Server POKE Client, Waiting... ");
-                  err = SSL_write(ssl,"POKE",strlen("POKE"));
-                  memset(pokemsg,0,sizeof(pokemsg));
-                  err = SSL_read(ssl,pokemsg,sizeof(msg)-1);
-                  if ((-1 == err) || (strncmp(pokemsg,"POKE_ACK",8)))
-                  {
-                     /* Client did not respond -OR- invalid reponse */
-                     if (err >= 0) {
-                        pokemsg[err] = '\0';
-                        if (DEBUG) printf("Received '%s'\n",pokemsg);
-                     }//if
-                     else {
-                        if (DEBUG) printf("Timeout\n");
-                     }//else
-                     
-                     if (DEBUG) printf("Closing SSL connection with Client\n");
-                     
-                     /* Close SSL connection with Client. */
-                     if (sd >= 0)     {close(sd);         sd =    -1;}
-                     if (NULL != ssl) {SSL_free(ssl);     ssl = NULL;}
-                     if (NULL != ctx) {SSL_CTX_free(ctx); ctx = NULL;}
-                     
-                     poke_count = 0;
-                     
-                     /* Notify the child process to STOP send/receive packets */
-                     strcpy(pokemsg,"STOP");
-                     write(fds[1],pokemsg,strlen(pokemsg)+1);
-                  }//if disconnect Client
-                  else {
-                     pokemsg[err] = '\0';
-                     if (DEBUG) printf("Received '%s', #pokes=%d\n",pokemsg,poke_count++);
-                  }//else
-               }//if ssl
-            }//if timer_fd
-            if (FD_ISSET(fd_tcp, &fdset)) {
-               /* Notify the child process to STOP send/receive packets */
-               strcpy(msg,"STOP");
-               write(fds[1],msg,strlen(msg)+1);
-               SLEEP(1);
-
-               if (DEBUG) printf("Session: ctx=%p, ssl=%p, sd=%d\n",ctx,ssl,sd);
-
-               /* PKI: Authenticate the Client */
-               if (!ctx || !ssl || (sd < 0)) {
-                  if (DEBUG) printf("PKI: Authenticating the Client...\n");
+            // Clear SSL session
+            if (conn->ssl) {
+                SSL_shutdown(conn->ssl);
+                SSL_free(conn->ssl);
+                conn->ssl = NULL;
+            }
+            if (conn->tcp_fd >= 0) {
+                close(conn->tcp_fd);
+                conn->tcp_fd = -1;
+            }
+            poke_count = 0;
+            
+            char input = getchar();
+            while (getchar() != '\n'); // Clear input buffer
+            
+            if (tolower(input) == 'k') {
+                printf("Enter CommonName (CN):\n>");
+                scanf("%511s", common_name);
+                printf("Enter KEY:\n>");
+                scanf("%31s", config.key);
+                while (getchar() != '\n');
+            } else if (tolower(input) == 'i') {
+                printf("Enter CommonName (CN):\n>");
+                scanf("%511s", common_name);
+                printf("Enter IV (%d bytes):\n", IV_LENGTH);
+                for (int i = 0; i < IV_LENGTH; i++) config.iv[i] = getchar();
+                while (getchar() != '\n');
+            } else if (tolower(input) == 'r') {
+                printf("Enter CommonName (CN):\n>");
+                scanf("%511s", common_name);
+                randomize_string(config.key, MAX_KEY_LENGTH);
+                randomize_array(config.iv, IV_LENGTH);
+                log_message(LOG_INFO, "Randomized KEY: %s", config.key);
+            } else if (tolower(input) == 'c') {
+                log_message(LOG_INFO, "Clearing SSL session");
+                sleep(1);
+                display_client_menu();
+                continue;
+            } else if (tolower(input) == 's') {
+                log_message(LOG_INFO, "Closing tunnel");
+                close(conn->tun_fd);
+                close(conn->udp_fd);
+                killpg(getpgid(getpid()), SIGTERM);
+                exit(0);
+            } else {
+                display_client_menu();
+                continue;
+            }
+            
+            // Re-establish SSL connection
+            conn->tcp_fd = socket(AF_INET, SOCK_STREAM, 0);
+            CHK_ERR(conn->tcp_fd, "create TCP socket");
+            CHK_ERR(connect(conn->tcp_fd, (struct sockaddr*)&sa, sizeof(sa)), "connect TCP socket");
+            
+            conn->ssl = SSL_new(conn->ssl_ctx);
+            CHK_NULL(conn->ssl);
+            SSL_set_fd(conn->ssl, conn->tcp_fd);
+            CHK_SSL(SSL_connect(conn->ssl), "SSL connect");
+            
+            // Send CN
+            snprintf(msg, sizeof(msg), "CN:%s", common_name);
+            CHK_SSL(SSL_write(conn->ssl, msg, strlen(msg)), "SSL write CN");
+            int err = SSL_read(conn->ssl, msg, sizeof(msg) - 1);
+            CHK_SSL(err, "SSL read CN response");
+            msg[err] = '\0';
+            cn_valid = strncmp(msg, "CN_ACK", 6) == 0;
+            log_message(cn_valid ? LOG_INFO : LOG_ERR, "CN response: %s", msg);
+            
+            // Send KEY
+            snprintf(msg, sizeof(msg), "KEY:%s", config.key);
+            CHK_SSL(SSL_write(conn->ssl, msg, strlen(msg)), "SSL write KEY");
+            err = SSL_read(conn->ssl, msg, sizeof(msg) - 1);
+            CHK_SSL(err, "SSL read KEY response");
+            msg[err] = '\0';
+            key_valid = strncmp(msg, "KEY_ACK", 7) == 0;
+            log_message(key_valid ? LOG_INFO : LOG_ERR, "KEY response: %s", msg);
+            
+            // Send IV
+            strcpy(msg, "IV:");
+            memcpy(msg + 3, config.iv, IV_LENGTH);
+            CHK_SSL(SSL_write(conn->ssl, msg, 3 + IV_LENGTH), "SSL write IV");
+            err = SSL_read(conn->ssl, msg, sizeof(msg) - 1);
+            CHK_SSL(err, "SSL read IV response");
+            msg[err] = '\0';
+            iv_valid = strncmp(msg, "IV_ACK", 6) == 0;
+            log_message(iv_valid ? LOG_INFO : LOG_ERR, "IV response: %s", msg);
+            
+            if (cn_valid && key_valid && iv_valid) {
+                // Send KEY to child
+                snprintf(msg, sizeof(msg), "KEY:%s", config.key);
+                write(conn->pipe_fd[1], msg, strlen(msg) + 1);
+                sleep(1);
                 
-                  /* SSL preliminaries. We keep the certificate and key with the context. */
-                  SSLeay_add_ssl_algorithms();
-                  SSL_load_error_strings();
-                  ctx = SSL_CTX_new (meth);
-                  if (!ctx) {ERR_print_errors_fp(stderr);err=-1;continue;}
+                // Send IV to child
+                strcpy(msg, "IV:");
+                memcpy(msg + 3, config.iv, IV_LENGTH);
+                write(conn->pipe_fd[1], msg, 3 + IV_LENGTH);
+                sleep(1);
+                
+                // Send remote address to child
+                strcpy(msg, "FROM:");
+                memcpy(msg + 5, &sa, sizeof(sa));
+                write(conn->pipe_fd[1], msg, 5 + sizeof(sa));
+                sleep(1);
+                
+                // Start child
+                strcpy(msg, "START");
+                write(conn->pipe_fd[1], msg, strlen(msg) + 1);
+                sleep(1);
+            }
+            
+            display_client_menu();
+        }
+    }
+    
+    if (conn->ssl) SSL_free(conn->ssl);
+    if (conn->tcp_fd >= 0) close(conn->tcp_fd);
+}
 
-                  SSL_CTX_set_verify(ctx,SSL_VERIFY_PEER,NULL); /* whether verify the certificate */
-                  SSL_CTX_load_verify_locations(ctx,SCACERT,NULL);
+void handle_server(Connection *conn) {
+    fd_set fdset;
+    char msg[BUFFER_LENGTH];
+    char pokemsg[BUFFER_LENGTH];
+    int poke_count = 0;
+    int cn_valid = 0, key_valid = 0, iv_valid = 0;
+    struct sockaddr_in client_addr;
+    socklen_t client_len = sizeof(client_addr);
+    
+    conn->timer_fd = timerfd_create(CLOCK_MONOTONIC, 0);
+    CHK_ERR(conn->timer_fd, "create timer");
+    
+    struct itimerspec time_period = {{POKE_INTERVAL, 0}, {POKE_INTERVAL, 0}};
+    CHK_ERR(timerfd_settime(conn->timer_fd, 0, &time_period, NULL), "set timer");
+    
+    printf("MiniVPN Server...\n");
+    
+    while (1) {
+        FD_ZERO(&fdset);
+        FD_SET(conn->tcp_fd, &fdset);
+        FD_SET(conn->timer_fd, &fdset);
         
-                  if (SSL_CTX_use_certificate_file(ctx,SCERTF,SSL_FILETYPE_PEM)<=0){
-                     ERR_print_errors_fp(stderr);err=-2;continue;}
-                  if (SSL_CTX_use_PrivateKey_file(ctx,SKEYF,SSL_FILETYPE_PEM)  <=0){
-                     ERR_print_errors_fp(stderr);err=-3;continue;}
-                  if (!SSL_CTX_check_private_key(ctx)){
-                     fprintf(stderr,"Private key does not match the certificate public key\n");err=-4;continue;}
-
-                  /* Prepare TCP socket for receiving connections */
-                  //listen_sd = socket(AF_INET,SOCK_STREAM,0);
-                  if (-1 == listen_sd) {perror("socket");err=-5;continue;}
+        if (select(conn->tcp_fd + conn->timer_fd + 1, &fdset, NULL, NULL, NULL) < 0) {
+            log_message(LOG_ERR, "Server select: %s", strerror(errno));
+            break;
+        }
         
-                  //memset(&sa_serv,0,sizeof(sa_serv));
-                  //sa_serv.sin_family      = AF_INET;
-                  //sa_serv.sin_addr.s_addr = INADDR_ANY;
-                  //sa_serv.sin_port        = htons(PORT); /* Server Port number */
+        if (FD_ISSET(conn->timer_fd, &fdset)) {
+            uint64_t exp;
+            read(conn->timer_fd, &exp, sizeof(exp));
+            
+            if (conn->ssl) {
+                CHK_SSL(SSL_write(conn->ssl, "POKE", strlen("POKE")), "SSL write POKE");
+                int err = SSL_read(conn->ssl, pokemsg, sizeof(pokemsg) - 1);
+                if (err <= 0 || strncmp(pokemsg, "POKE_ACK", 8) != 0) {
+                    log_message(LOG_ERR, "POKE failed, closing SSL");
+                    if (conn->ssl) {
+                        SSL_shutdown(conn->ssl);
+                        SSL_free(conn->ssl);
+                        conn->ssl = NULL;
+                    }
+                    if (conn->tcp_fd >= 0) {
+                        close(conn->tcp_fd);
+                        conn->tcp_fd = -1;
+                    }
+                    poke_count = 0;
+                    strcpy(pokemsg, "STOP");
+                    write(conn->pipe_fd[1], pokemsg, strlen(pokemsg) + 1);
+                } else {
+                    pokemsg[err] = '\0';
+                    log_message(LOG_DEBUG, "Received POKE_ACK (%d)", poke_count++);
+                }
+            }
+        }
         
-                  //err = bind(listen_sd,(struct sockaddr*)&sa_serv,sizeof(sa_serv));
-                  //if (-1 == err) {perror("bind");err=-6;continue;}
-                  
-                  /* Receive a TCP connection. */
-                  err = listen(listen_sd,5);
-                  if (-1 == err) {perror("listen");err=-7;continue;}
+        if (FD_ISSET(conn->tcp_fd, &fdset)) {
+            strcpy(msg, "STOP");
+            write(conn->pipe_fd[1], msg, strlen(msg) + 1);
+            sleep(1);
+            
+            if (!conn->ssl || conn->tcp_fd < 0) {
+                conn->tcp_fd = accept(conn->tcp_fd, (struct sockaddr*)&client_addr, &client_len);
+                CHK_ERR(conn->tcp_fd, "accept TCP connection");
+                log_message(LOG_INFO, "Connection from %s:%d", inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
+                
+                conn->ssl = SSL_new(conn->ssl_ctx);
+                CHK_NULL(conn->ssl);
+                SSL_set_fd(conn->ssl, conn->tcp_fd);
+                CHK_SSL(SSL_accept(conn->ssl), "SSL accept");
+                
+                X509 *client_cert = SSL_get_peer_certificate(conn->ssl);
+                CHK_NULL(client_cert);
+                char *str = X509_NAME_oneline(X509_get_subject_name(client_cert), 0, 0);
+                char subject[512];
+                strncpy(subject, str, sizeof(subject) - 1);
+                log_message(LOG_INFO, "Client certificate subject: %s", str);
+                OPENSSL_free(str);
+                str = X509_NAME_oneline(X509_get_issuer_name(client_cert), 0, 0);
+                log_message(LOG_INFO, "Client certificate issuer: %s", str);
+                OPENSSL_free(str);
+                X509_free(client_cert);
+                
+                // Receive and verify CN
+                int err = SSL_read(conn->ssl, msg, sizeof(msg) - 1);
+                CHK_SSL(err, "SSL read CN");
+                msg[err] = '\0';
+                log_message(LOG_DEBUG, "Received CN: %s", msg);
+                cn_valid = 0;
+                if (strncmp(msg, "CN:", 3) == 0) {
+                    char *cn_start = strstr(subject, "/CN=");
+                    if (cn_start) {
+                        char *cn_end = strstr(&cn_start[1], "/");
+                        if (cn_end) {
+                            int cn_len = cn_end - (cn_start + 4);
+                            if (strncmp(cn_start + 4, msg + 3, cn_len) == 0) {
+                                cn_valid = 1;
+                            }
+                        }
+                    }
+                }
+                CHK_SSL(SSL_write(conn->ssl, cn_valid ? "CN_ACK" : "CN_NACK", cn_valid ? 6 : 7), "SSL write CN response");
+                
+                // Receive KEY
+                err = SSL_read(conn->ssl, msg, sizeof(msg) - 1);
+                CHK_SSL(err, "SSL read KEY");
+                msg[err] = '\0';
+                log_message(LOG_DEBUG, "Received KEY: %s", msg);
+                key_valid = 0;
+                if (strncmp(msg, "KEY:", 4) == 0) {
+                    strncpy(config.key, msg + 4, MAX_KEY_LENGTH);
+                    key_valid = 1;
+                }
+                CHK_SSL(SSL_write(conn->ssl, key_valid ? "KEY_ACK" : "KEY_NACK", key_valid ? 7 : 8), "SSL write KEY response");
+                
+                // Receive IV
+                err = SSL_read(conn->ssl, msg, sizeof(msg) - 1);
+                CHK_SSL(err, "SSL read IV");
+                msg[err] = '\0';
+                iv_valid = 0;
+                if (strncmp(msg, "IV:", 3) == 0) {
+                    memcpy(config.iv, msg + 3, IV_LENGTH);
+                    iv_valid = 1;
+                }
+                CHK_SSL(SSL_write(conn->ssl, iv_valid ? "IV_ACK" : "IV_NACK", iv_valid ? 6 : 7), "SSL write IV response");
+                
+                if (cn_valid && key_valid && iv_valid) {
+                    strcpy(msg, "KEY:");
+                    strcat(msg, config.key);
+                    write(conn->pipe_fd[1], msg, strlen(msg) + 1);
+                    sleep(1);
+                    
+                    strcpy(msg, "IV:");
+                    memcpy(msg + 3, config.iv, IV_LENGTH);
+                    write(conn->pipe_fd[1], msg, 3 + IV_LENGTH);
+                    sleep(1);
+                    
+                    strcpy(msg, "FROM:");
+                    memcpy(msg + 5, &client_addr, sizeof(client_addr));
+                    write(conn->pipe_fd[1], msg, 5 + sizeof(client_addr));
+                    sleep(1);
+                    
+                    strcpy(msg, "START");
+                    write(conn->pipe_fd[1], msg, strlen(msg) + 1);
+                    sleep(1);
+                }
+            }
+        }
+    }
+    
+    if (conn->ssl) SSL_free(conn->ssl);
+    if (conn->tcp_fd >= 0) close(conn->tcp_fd);
+    if (conn->timer_fd >= 0) close(conn->timer_fd);
+}
 
-                  client_len = sizeof(sa_cli);
-                  sd = accept(listen_sd,(struct sockaddr*)&sa_cli,&client_len);
-                  if (-1 == sd) {perror("accept");err=-8;continue;}
-                  //close(listen_sd);
-
-                  //if (DEBUG) printf("Connection from %lx, port %d\n",sa_cli.sin_addr.s_addr,sa_cli.sin_port);
-                  if (DEBUG) printf("Connection from ip:port %s:%i established\n",
-                                     inet_ntoa(sa_cli.sin_addr/*.s_addr*/),ntohs(sa_cli.sin_port));
-
-                  /* TCP connection is ready. Do server side SSL. */
-                  ssl = SSL_new(ctx);     if (NULL == ssl) {printf("TCP connect failure\n");err=-9;continue;}
-                  SSL_set_fd(ssl,sd);
-                  err = SSL_accept(ssl);  if (-1 == err) {ERR_print_errors_fp(stderr);err=-10;continue;}
-                  
-                  /* Get the cipher - opt */
-                  if (DEBUG) printf("SSL connection using %s\n",SSL_get_cipher(ssl));
+void handle_child(Connection *conn) {
+    char buf[MAX_BLOCK_LENGTH];
+    unsigned char out[MAX_BLOCK_LENGTH];
+    unsigned char hmac[HASH_LENGTH];
+    int ok_to_start = 0;
+    struct sockaddr_in from = {0};
+    fd_set fdset;
+    
+    close(conn->pipe_fd[1]); // Close write end
+    
+    while (1) {
+        FD_ZERO(&fdset);
+        FD_SET(conn->pipe_fd[0], &fdset);
+        FD_SET(conn->tun_fd, &fdset);
+        FD_SET(conn->udp_fd, &fdset);
         
-                  /* Get client's certificate (note: beware of dynamic allocation) - opt */
-                  client_cert = SSL_get_peer_certificate(ssl);
-                  if (NULL == client_cert) {printf("Client does not have certificate.\n");err=-11;continue;}
-                  if (DEBUG) printf("Client certificate:\n");
-          
-                  str = X509_NAME_oneline(X509_get_subject_name(client_cert),0,0);
-                  if (NULL == str) {err=-12;continue;}
-                  strncpy(subjectstr,str,sizeof(subjectstr)-1);
-                  if (DEBUG) printf("\t subject: %s\n",str);
-                  OPENSSL_free(str);
-                  
-                  str = X509_NAME_oneline(X509_get_issuer_name(client_cert),0,0);
-                  if (NULL == str) {err=-13;continue;}
-                  strncpy(issuerstr,str,sizeof(issuerstr)-1);
-                  if (DEBUG) printf("\t issuer: %s\n",str);
-                  OPENSSL_free(str);
+        if (select(conn->pipe_fd[0] + conn->tun_fd + conn->udp_fd + 1, &fdset, NULL, NULL, NULL) < 0) {
+            log_message(LOG_ERR, "Child select: %s", strerror(errno));
+            break;
+        }
+        
+        if (FD_ISSET(conn->pipe_fd[0], &fdset)) {
+            memset(buf, 0, sizeof(buf));
+            int len = read(conn->pipe_fd[0], buf, sizeof(buf));
+            CHK_ERR(len, "read pipe");
+            
+            if (strncmp(buf, "KEY:", 4) == 0) {
+                log_message(LOG_DEBUG, "Received KEY: %s", buf + 4);
+                strncpy(config.key, buf + 4, MAX_KEY_LENGTH);
+            } else if (strncmp(buf, "IV:", 3) == 0) {
+                log_message(LOG_DEBUG, "Received IV");
+                memcpy(config.iv, buf + 3, IV_LENGTH);
+            } else if (strncmp(buf, "FROM:", 5) == 0) {
+                log_message(LOG_DEBUG, "Received FROM");
+                memcpy(&from, buf + 5, sizeof(from));
+            } else if (strncmp(buf, "START", 5) == 0) {
+                log_message(LOG_INFO, "Tunnel starting");
+                ok_to_start = 1;
+            } else if (strncmp(buf, "STOP", 4) == 0) {
+                log_message(LOG_INFO, "Tunnel stopping");
+                ok_to_start = 0;
+            }
+        }
+        
+        if (FD_ISSET(conn->tun_fd, &fdset) && ok_to_start) {
+            int len = read(conn->tun_fd, buf, sizeof(buf));
+            CHK_ERR(len, "read tun");
+            
+            int out_len;
+            encrypt_data((unsigned char*)buf, len, out, &out_len);
+            if (out_len > MAX_BLOCK_LENGTH - HASH_LENGTH) {
+                log_message(LOG_ERR, "Encrypted data too large");
+                continue;
+            }
+            
+            unsigned int hmac_len;
+            create_hmac((unsigned char*)buf, len, hmac, &hmac_len);
+            memcpy(out + out_len, hmac, hmac_len);
+            out_len += hmac_len;
+            
+            if (sendto(conn->udp_fd, out, out_len, 0, (struct sockaddr*)&from, sizeof(from)) < 0) {
+                log_message(LOG_ERR, "sendto: %s", strerror(errno));
+            }
+        } else if (FD_ISSET(conn->tun_fd, &fdset)) {
+            read(conn->tun_fd, buf, sizeof(buf)); // Discard
+        }
+        
+        if (FD_ISSET(conn->udp_fd, &fdset) && ok_to_start) {
+            struct sockaddr_in src_addr;
+            socklen_t src_len = sizeof(src_addr);
+            int len = recvfrom(conn->udp_fd, buf, sizeof(buf), 0, (struct sockaddr*)&src_addr, &src_len);
+            CHK_ERR(len, "recvfrom");
+            
+            if (src_addr.sin_addr.s_addr != from.sin_addr.s_addr || src_addr.sin_port != from.sin_port) {
+                log_message(LOG_WARNING, "Packet from unexpected source %s:%d", 
+                           inet_ntoa(src_addr.sin_addr), ntohs(src_addr.sin_port));
+                continue;
+            }
+            
+            len -= HASH_LENGTH;
+            if (!verify_hmac((unsigned char*)buf, len, (unsigned char*)buf + len, HASH_LENGTH)) {
+                log_message(LOG_ERR, "HMAC verification failed");
+                continue;
+            }
+            
+            int out_len;
+            decrypt_data((unsigned char*)buf, len, out, &out_len);
+            if (write(conn->tun_fd, out, out_len) < 0) {
+                log_message(LOG_ERR, "write tun: %s", strerror(errno));
+            }
+        } else if (FD_ISSET(conn->udp_fd, &fdset)) {
+            struct sockaddr_in src_addr;
+            socklen_t src_len = sizeof(src_addr);
+            read(conn->udp_fd, buf, sizeof(buf)); // Discard
+        }
+    }
+    
+    close(conn->pipe_fd[0]);
+    close(conn->tun_fd);
+    close(conn->udp_fd);
+}
 
-                  /* We can do all sorts of certificate verification stuff here before
-                     deallocating the certificate. */
-                  X509_free (client_cert);
-               }//if
-
-               /* DATA EXCHANGE - Receive messages and send replies */
-               if (ssl) {
-                  /* Read CN from Client */
-                  err = SSL_read(ssl,msg,sizeof(msg)-1);
-                  if (-1 == err) {ERR_print_errors_fp(stderr);err=-14;continue;}
-                  msg[err] = '\0';
-                  if (DEBUG) printf("Received from Client %d chars:'%s'\n",err,msg);
-                  /* Audit CN from Client */
-                  cnValid = 0;
-                  if (!strncmp(msg,"CN:",3)) {
-                     char *pch_start = strstr(subjectstr,"/CN=");
-                     if (NULL != pch_start) {
-                        char *pch_end = strstr(&pch_start[1],"/");
-                        if (NULL != pch_end) {
-                           int cn_len = (int)pch_end - (int)&pch_start[4];
-                           if (!strncmp(&pch_start[4],&msg[3],cn_len)) {
-                              cnValid=1;
-                           }//if
-                        }//if
-                     }//if
-                  }//if
-                  /* Write CN reply to Client */
-                  if (1 == cnValid) {
-                     err = SSL_write(ssl,"CN_ACK",strlen("CN_ACK"));
-                     if (-1 == err) {ERR_print_errors_fp(stderr);err=-15;continue;}
-                  }//if
-                  else {
-                     err = SSL_write(ssl,"CN_NACK",strlen("CN_NACK"));
-                     if (-1 == err) {ERR_print_errors_fp(stderr);err=-16;continue;}
-                  }//else
-
-                  /* Read KEY from Client */
-                  err = SSL_read(ssl,msg,sizeof(msg)-1); 
-                  if (-1 == err) {ERR_print_errors_fp(stderr);err=-17;continue;}
-                  msg[err] = '\0';
-                  if (DEBUG) printf("Received from Client %d chars:'%s'\n",err,msg);
-                  /* Write KEY reply to Client */
-                  if (!strncmp(msg,"KEY:",4)) {
-                     strncpy(KEY,&msg[4],MAX_KEY_LENGTH);
-                     keyValid=1;
-                     err = SSL_write(ssl,"KEY_ACK",strlen("KEY_ACK"));
-                     if (-1 == err) {ERR_print_errors_fp(stderr);err=-18;continue;}
-                  }//if
-                  else {
-                     keyValid=0;
-                     err = SSL_write(ssl,"KEY_NACK",strlen("KEY_NACK"));
-                     if (-1 == err) {ERR_print_errors_fp(stderr);err=-19;continue;}
-                  }//else
-                  
-                  /* Read IV from Client */
-                  err = SSL_read(ssl,msg,sizeof(msg)-1);
-                  if (-1 == err) {ERR_print_errors_fp(stderr);err=-20;continue;}
-                  msg[err] = '\0';
-                  if (DEBUG) {printf("Received from Client %d chars:'%c%c%c",err,msg[0],msg[1],msg[2]);
-                              dumpBuf(&msg[3],err-3);printf("'\n");}
-                  /* Write IV reply to Client */
-                  if (!strncmp(msg,"IV:",3)) {
-                     memcpy(IV,&msg[3],IV_LENGTH);
-                     ivValid=1;
-                     err = SSL_write(ssl,"IV_ACK",strlen("IV_ACK"));
-                     if (-1 == err) {ERR_print_errors_fp(stderr);err=-21;continue;}
-                  }//if
-                  else {
-                     ivValid=0;
-                     err = SSL_write(ssl,"IV_NACK",strlen("IV_NACK"));
-                     if (-1 == err) {ERR_print_errors_fp(stderr);err=-22;continue;}
-                  }//else
-
-#if 0
-                     /* Clean up. */
-                     if (sd >= 0)     {close(sd);         sd = -1;}
-                     if (NULL != ssl) {SSL_free(ssl);     ssl = NULL;}
-                     if (NULL != ctx) {SSL_CTX_free(ctx); ctx = NULL;}
-#endif
-
-                  if (cnValid && keyValid && ivValid) {
-                     /* Write KEY to the child process */
-                     strcpy(msg,"KEY:");
-                     strcat(msg,KEY);
-                     write(fds[1],msg,strlen(msg)+1);
-                     SLEEP(1);
-                  
-                     /* Write IV to the child process */
-                     strcpy(msg,"IV:");
-                     memcpy(&msg[3],&IV,sizeof(IV));
-                     write(fds[1],msg,3+sizeof(IV));
-                     SLEEP(1);
-                     
-                     /* Initialize FROM to point to Client's ip:port */
-                     memset(&from,0,sizeof(from));
-                     fromlen = sizeof(from);
-                     from = sa_cli;
-
-                     /* Write FROM to the child process */
-                     strcpy(msg,"FROM:");
-                     memcpy(&msg[5],&from,sizeof(from));
-                     write(fds[1],msg,5+sizeof(from));
-                     SLEEP(1);
-
-                     /* Notify the child process to be ready to send/receive packets */
-                     strcpy(msg,"START");
-                     write(fds[1],msg,strlen(msg)+1);
-                     SLEEP(1);
-                  }//if VALID
-               }// ssl
-            }//else if TCP
-         }// while
-      }// if Server-PARENT
-      else {                 /* UDP use keys */
-         /* Server-Child process */
-         int okToStart = 0;
-         struct sockaddr_in from;
-
-         /* close our copy of the write end of pipe */
-         close(fds[1]);
-
-         /* Set unblock pipe read */
-
-         /* Tunnel connection */
-
-         /* Keep reading from fds[0], fd_udp, fd_tunnel */
-
-         /* If notification is not received, do not send/receive */
-
-         while (1) {
-            FD_ZERO(&fdset);
-            FD_SET(fds[0],   &fdset); /* Pipe from Parent */
-            FD_SET(fd_tunnel,&fdset); /* Tunnel */
-            FD_SET(fd_udp,   &fdset); /* Net-UDP */
-            if (select(fds[0]+fd_tunnel+fd_udp+1,&fdset,NULL,NULL,NULL) < 0) PERROR("Server-Child select");
-            if (FD_ISSET(fds[0], &fdset)) {
-               memset(buf,0,sizeof(buf));
-               l = read(fds[0], buf, sizeof(buf));
-               if (l < 0) PERROR("read");
-               if (!strncmp(buf,"KEY:",4)) {
-                  if (DEBUG) printf("KEY: [%s] received from Server-Parent\n",&buf[4]);
-                  strncpy(KEY,&buf[4],sizeof(KEY));
-               }//if
-               else if (!strncmp(buf,"IV:",3)) {
-                  if (DEBUG) {
-                     printf("IV: [");
-                     dumpBuf(&buf[3],sizeof(IV));
-                     printf("] received from Server-Parent\n",&buf[3]);
-                  }//if
-                  memcpy(IV,&buf[3],sizeof(IV));
-               }//else if
-               else if (!strncmp(buf,"FROM:",5)) {
-                  if (DEBUG) printf("FROM: received from Server-Parent\n");
-                  memcpy(&from,&buf[5],sizeof(from));
-               }//else if
-               else if (!strncmp(buf,"START",5)) {
-                  if (DEBUG) printf("START received from Server-Parent\n");
-                  okToStart = 1;
-                  /*if (DEBUG)*/ printf("Server Tunnel running...\n");
-               }//else if
-               else if (!strncmp(buf,"STOP",4)) {
-                  if (DEBUG) printf("STOP received from Server-Parent\n");
-                  okToStart = 0;
-                  /*if (DEBUG)*/ printf("Server Tunnel stopped\n");
-               }//else if
-               else okToStart = 0;
-            }//if
-            else if (FD_ISSET(fd_tunnel, &fdset)) {
-               if (okToStart) {
-                  /* wait for data from tunnel, then encrypt+hash, then send to "remote/from" network socket */
-                  if (DEBUG) write(1,">", 1);
-                  l = read(fd_tunnel, buf, sizeof(buf));
-                  if (l < 0) PERROR("read");
-                  else {
-                     if (DEBUG) {printf("\nTx=%d[",l); dumpBuf(buf,l); printf("]\n");}
-                     outl = sizeof(out);
-                     do_encrypt(buf,l,out,&outl);
-                     if (outl > MAX_BLOCK_LENGTH) PERROR("Encrypt Too Big");
-                     if (DEBUG) {printf("\nEncrypt=%d[",outl); dumpBuf(out,outl); printf("]\n");}
-                     createHash(buf, l, md_value, &md_len);
-                     if ((outl + md_len) > MAX_BLOCK_LENGTH) PERROR("Encrypt+Hash Too Big");
-                     if (DEBUG) {printf("Hash=%d[",md_len); dumpBuf(md_value,md_len); printf("]\n");}
-                     for (i=0; i<md_len; i++) {out[outl+i] = md_value[i];}
-                     outl += md_len;
-                     if (sendto(fd_udp, out, outl, 0, (struct sockaddr *)&from, sizeof(from)) < 0)PERROR("sendto");
-                  }//else
-               }//if okToStart
-               else if (!okToStart) { /* "read" from Tunnel and DISCARD */
-                  l = read(fd_tunnel, buf, sizeof(buf));
-                  if (l < 0) PERROR("read");
-               }//else if !okToStart
-            }//else if
-            else if (FD_ISSET(fd_udp, &fdset)) {
-               if (okToStart) {
-                  /* wait for data from "remote/from" node, audit connection, decrypt+rehash+audit,
-                     then forward to tunnel */
-                  if (DEBUG) write(1,"<", 1);
-                  /* do *not* use "from" so that we can audit which node the recieved packet comes from */
-                  soutlen = sizeof(sout);
-                  l = recvfrom(fd_udp, buf, sizeof(buf), 0, (struct sockaddr *)&sout, &soutlen);
-                  if (l < 0) {
-                      printf("fd_udp=%d,buf=%p,bufsize=%d,flags=%d,sockaddr=%p,soutlen=%p\n",
-                              fd_udp,buf,sizeof(buf),0,&sout,&soutlen);
-                      PERROR("recvfrom");
-                  }//if
-                  else {
-                     /* audit to make sure data came from node "established" at connection time */
-                     if ((sout.sin_addr.s_addr != from.sin_addr.s_addr) || (sout.sin_port != from.sin_port)) {
-#if 0
-                        printf("Got packet from  %s:%i instead of %s:%i\n", 
-                                 (char *)inet_ntoa(sout.sin_addr/*.s_addr*/), ntohs(sout.sin_port),
-                                 (char *)inet_ntoa(from.sin_addr/*.s_addr*/), ntohs(from.sin_port));
-                        printf("Updating FROM with this new ip:port\n");
-#endif
-                        from = sout;
-                     }//if
-                     else
-                     {
-                        /* data from correct node, subtract off HASH, decrypt+rehash, audit hash,
-                           then forward to tunnel */
-                        l -= HASH_LENGTH;
-                        outl = sizeof(out);
-                        if (DEBUG) {printf("\nRx=%d[",l); dumpBuf(buf,l); printf("]\n");}
-                        if (DEBUG) {printf("Hash=%d[",HASH_LENGTH); dumpBuf(&buf[l],HASH_LENGTH); printf("]\n");}
-                        do_decrypt(buf,l,out,&outl);
-                        if (DEBUG) {printf("\nDecrypt=%d[",outl); dumpBuf(out,outl); printf("]\n");}
-                        createHash(out, outl, md_value, &md_len);
-                        if (!isEqual(&buf[l], md_value, md_len)) PERROR("HASH");
-                        if (write(fd_tunnel, out, outl) < 0) PERROR("write");
-                     }//else
-                  }//else
-               }//if okToStart
-               else if (!okToStart) { /* "receive" from node and DISCARD */
-                  soutlen = sizeof(sout);
-                  l = recvfrom(fd_udp, buf, sizeof(buf), 0, (struct sockaddr *)&sout, &soutlen);
-                  if (l < 0) {
-                      printf("fd_udp=%d,buf=%p,bufsize=%d,flags=%d,sockaddr=%p,soutlen=%p\n",
-                              fd_udp,buf,sizeof(buf),0,&sout,&soutlen);
-                      PERROR("recvfrom");
-                  }//if
-               }//else if !okToStart
-              }//else if
-          }//while
-      }// else Server-CHILD
-   }// else SERVER
-
-}//main
+int main(int argc, char *argv[]) {
+    openlog("tunproxy", LOG_PID, LOG_DAEMON);
+    srand(time(NULL));
+    
+    int opt;
+    char *config_file = "tunproxy.conf";
+    while ((opt = getopt(argc, argv, "c:dh")) != -1) {
+        switch (opt) {
+            case 'c': config_file = optarg; break;
+            case 'd': config.debug = 1; break;
+            case 'h':
+                printf("Usage: %s [-c config_file] [-d] [-h]\n", argv[0]);
+                return 0;
+            default: return 1;
+        }
+    }
+    
+    if (load_config(config_file) < 0) {
+        log_message(LOG_ERR, "Configuration loading failed");
+        return 1;
+    }
+    
+    if (config.mode == -1) {
+        log_message(LOG_ERR, "Mode (client/server) must be specified in config");
+        return 1;
+    }
+    
+    Connection conn = {0};
+    conn.tun_fd = init_tun_device(config.interface);
+    conn.udp_fd = init_udp_socket(config.port);
+    conn.tcp_fd = init_tcp_socket(config.port, config.mode);
+    conn.ssl_ctx = init_ssl_context(config.mode);
+    
+    CHK_ERR(pipe(conn.pipe_fd), "create pipe");
+    
+    pid_t pid = fork();
+    if (pid < 0) {
+        log_message(LOG_ERR, "Fork failed: %s", strerror(errno));
+        return 1;
+    }
+    
+    if (pid > 0) { // Parent process
+        close(conn.pipe_fd[0]); // Close read end
+        if (config.mode == CLIENT) {
+            handle_client(&conn);
+        } else {
+            handle_server(&conn);
+        }
+        close(conn.pipe_fd[1]);
+    } else { // Child process
+        handle_child(&conn);
+    }
+    
+    if (conn.ssl_ctx) SSL_CTX_free(conn.ssl_ctx);
+    if (conn.tcp_fd >= 0) close(conn.tcp_fd);
+    if (conn.udp_fd >= 0) close(conn.udp_fd);
+    if (conn.tun_fd >= 0) close(conn.tun_fd);
+    
+    closelog();
+    return 0;
+}
